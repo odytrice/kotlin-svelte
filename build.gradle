@@ -1,0 +1,199 @@
+plugins {
+    id 'application'
+    id 'org.springframework.boot' version "${springBootVersion}"
+    id 'io.spring.dependency-management' version '1.1.7'
+    id 'org.jetbrains.kotlin.jvm' version "${kotlinVersion}"
+    id 'org.jetbrains.kotlin.plugin.spring' version "${kotlinVersion}"
+    id 'com.github.node-gradle.node' version "${nodePluginVersion}"
+}
+
+group = 'com.example'
+version = '0.0.1'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'com.fasterxml.jackson.module:jackson-module-kotlin'
+    implementation 'org.jetbrains.kotlin:kotlin-reflect'
+
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.jetbrains.kotlin:kotlin-test-junit5'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+kotlin {
+    compilerOptions {
+        freeCompilerArgs.addAll '-Xjsr305=strict'
+    }
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// =============================================================================
+// Node / Frontend Configuration
+// =============================================================================
+
+node {
+    version = clientNodeVersion
+    npmVersion = clientNpmVersion
+    download = true
+    nodeProjectDir = file("${project.projectDir}/client")
+}
+
+// =============================================================================
+// Custom Tasks
+// =============================================================================
+
+def clientDir = file("${project.projectDir}/client")
+def clientDist = file("${clientDir}/dist")
+def deployDir = file("${project.projectDir}/.deploy")
+
+// --- Clean ---
+clean {
+    delete deployDir
+    delete clientDist
+}
+
+// --- Build Client ---
+task buildClient(type: com.github.gradle.node.npm.task.NpmTask) {
+    dependsOn npmInstall
+    args = ['run', 'build']
+    description = 'Builds the Svelte frontend for production'
+    group = 'build'
+}
+
+// Make the main build depend on building the client
+build.dependsOn buildClient
+
+// --- Bundle ---
+task bundle {
+    dependsOn build
+    description = 'Creates a production bundle in .deploy/ with the server JAR and client assets'
+    group = 'distribution'
+
+    doLast {
+        // Clean deploy directory
+        delete deployDir
+        mkdir deployDir
+
+        // Copy the Spring Boot fat JAR
+        copy {
+            from tasks.named('bootJar').get().archiveFile
+            into deployDir
+            rename { 'server.jar' }
+        }
+
+        // Copy the client dist into .deploy/public/
+        copy {
+            from clientDist
+            into file("${deployDir}/public")
+        }
+
+        println "Bundle created in ${deployDir}"
+    }
+}
+
+// --- Dev Mode: Run both servers in parallel ---
+task dev {
+    description = 'Runs Spring Boot backend and Vite dev server in parallel'
+    group = 'application'
+
+    doLast {
+        def processes = []
+
+        // Start Spring Boot
+        def serverProcess = new ProcessBuilder(
+            './gradlew', 'bootRun'
+        )
+        .directory(project.projectDir)
+        .redirectErrorStream(true)
+        .start()
+        processes.add(serverProcess)
+
+        // Start Vite dev server
+        def npmCmd = node.download.get()
+            ? file("${node.workDir.get()}/node-v${node.version.get()}-${osName()}-${osArch()}/bin/npm").absolutePath
+            : 'npm'
+
+        def clientProcess = new ProcessBuilder(
+            npmCmd, 'run', 'dev'
+        )
+        .directory(clientDir)
+        .redirectErrorStream(true)
+        .start()
+        processes.add(clientProcess)
+
+        // Forward output with labels
+        def serverThread = Thread.start {
+            serverProcess.inputStream.eachLine { line ->
+                println "\u001B[34m[server]\u001B[0m ${line}"
+            }
+        }
+
+        def clientThread = Thread.start {
+            clientProcess.inputStream.eachLine { line ->
+                println "\u001B[33m[client]\u001B[0m ${line}"
+            }
+        }
+
+        // Handle shutdown
+        Runtime.getRuntime().addShutdownHook(new Thread({
+            processes.each { it.destroyForcibly() }
+        }))
+
+        // Wait for either process to exit
+        def exitCode = serverProcess.waitFor()
+        clientProcess.destroyForcibly()
+        serverThread.join()
+        clientThread.join()
+    }
+}
+
+// --- Helpers ---
+static String osName() {
+    def os = System.getProperty('os.name').toLowerCase()
+    if (os.contains('mac') || os.contains('darwin')) return 'darwin'
+    if (os.contains('linux')) return 'linux'
+    if (os.contains('win')) return 'win'
+    return os
+}
+
+static String osArch() {
+    def arch = System.getProperty('os.arch').toLowerCase()
+    if (arch == 'aarch64' || arch == 'arm64') return 'arm64'
+    if (arch == 'amd64' || arch == 'x86_64') return 'x64'
+    return arch
+}
+
+// --- Spring Boot Configuration ---
+springBoot {
+    mainClass = 'com.example.server.ApplicationKt'
+}
+
+bootRun {
+    // Enable Spring DevTools for live reload
+    jvmArgs = ['-Dspring.devtools.restart.enabled=true']
+}
+
+// For the bundle task: configure the bootJar to produce a runnable standalone JAR
+bootJar {
+    // Copy client dist into the JAR's static resources
+    // This is used when running the bundled JAR directly (not the .deploy layout)
+    from(clientDist) {
+        into 'BOOT-INF/classes/public'
+    }
+    mustRunAfter buildClient
+}
