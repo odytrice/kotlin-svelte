@@ -108,33 +108,32 @@ task bundle {
 
 // --- Dev Mode: Run both servers in parallel ---
 task dev {
+    dependsOn npmInstall
     description = 'Runs Spring Boot backend and Vite dev server in parallel'
     group = 'application'
 
     doLast {
-        def processes = []
+        def nodeDir = node.download.get()
+            ? file("${node.workDir.get()}/node-v${node.version.get()}-${osName()}-${osArch()}/bin").absolutePath
+            : ''
 
-        // Start Spring Boot
+        // Start Spring Boot via bootRun
         def serverProcess = new ProcessBuilder(
             './gradlew', 'bootRun'
         )
         .directory(project.projectDir)
         .redirectErrorStream(true)
         .start()
-        processes.add(serverProcess)
 
-        // Start Vite dev server
-        def npmCmd = node.download.get()
-            ? file("${node.workDir.get()}/node-v${node.version.get()}-${osName()}-${osArch()}/bin/npm").absolutePath
-            : 'npm'
-
-        def clientProcess = new ProcessBuilder(
-            npmCmd, 'run', 'dev'
-        )
-        .directory(clientDir)
-        .redirectErrorStream(true)
-        .start()
-        processes.add(clientProcess)
+        // Start Vite dev server directly
+        def npxCmd = nodeDir ? (nodeDir + '/npx') : 'npx'
+        def clientBuilder = new ProcessBuilder(npxCmd, 'vite')
+        clientBuilder.directory(clientDir)
+        clientBuilder.redirectErrorStream(true)
+        if (nodeDir) {
+            clientBuilder.environment().put('PATH', nodeDir + ':' + System.getenv('PATH'))
+        }
+        def clientProcess = clientBuilder.start()
 
         // Forward output with labels
         def serverThread = Thread.start {
@@ -149,16 +148,30 @@ task dev {
             }
         }
 
-        // Handle shutdown
+        // Recursively destroy a process and all its descendants (Java 9+ ProcessHandle API)
+        def destroyTree = { Process proc ->
+            try {
+                proc.toHandle().descendants().forEach { h -> h.destroyForcibly() }
+                proc.toHandle().destroyForcibly()
+            } catch (Exception ignored) {
+                proc.destroyForcibly()
+            }
+        }
+
         Runtime.getRuntime().addShutdownHook(new Thread({
-            processes.each { it.destroyForcibly() }
+            destroyTree(serverProcess)
+            destroyTree(clientProcess)
         }))
 
-        // Wait for either process to exit
-        def exitCode = serverProcess.waitFor()
-        clientProcess.destroyForcibly()
-        serverThread.join()
-        clientThread.join()
+        // Wait for either process to exit, then tear down the other
+        try {
+            serverProcess.waitFor()
+        } finally {
+            destroyTree(clientProcess)
+            destroyTree(serverProcess)
+            serverThread.join(3000)
+            clientThread.join(3000)
+        }
     }
 }
 
